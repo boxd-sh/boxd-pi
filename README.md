@@ -60,7 +60,7 @@ For a private GitHub repo the extension uses the token from your `gh` login for
 the clone. The clone runs in the machine, so the machine gets the token for
 that one command. It is not written to the machine's git config or disk.
 `/boxd push` gives the machine your token in the same way, after the agent has
-worked in it: read [SECURITY.md](SECURITY.md) before you push from a machine
+worked in it: read [SECURITY.md](https://github.com/boxd-sh/boxd-pi/blob/main/SECURITY.md) before you push from a machine
 whose agent you don't trust.
 
 ## Flags
@@ -157,7 +157,7 @@ The extension overrides Pi's built-in tools with versions that call the
 Your boxd API key never enters the machine, and nothing from your shell
 environment goes with a command except Pi's `PI_*` variables. The one secret
 that does reach the machine is your GitHub token, for the clone and for
-`/boxd push`: see [SECURITY.md](SECURITY.md).
+`/boxd push`: see [SECURITY.md](https://github.com/boxd-sh/boxd-pi/blob/main/SECURITY.md).
 
 | Pi does | The extension does |
 | --- | --- |
@@ -177,13 +177,13 @@ until you delete it with `/boxd delete` first, or from the
 Each one runs `pi -p` against real boxd and leaves no machine behind (pass
 `--keep` to keep them).
 
-- [`examples/quickstart.sh`](examples/quickstart.sh): one prompt on a fresh
+- [`examples/quickstart.sh`](https://github.com/boxd-sh/boxd-pi/blob/main/examples/quickstart.sh): one prompt on a fresh
   machine, deleted when Pi exits.
-- [`examples/persistent-session.sh`](examples/persistent-session.sh): the
+- [`examples/persistent-session.sh`](https://github.com/boxd-sh/boxd-pi/blob/main/examples/persistent-session.sh): the
   first run commits a file and starts a server in the background, then Pi
   quits and the machine hibernates. Opening the preview URL wakes it, and the
   second run resumes the session: same files, server still running.
-- [`examples/parallel-forks.sh`](examples/parallel-forks.sh): set a project
+- [`examples/parallel-forks.sh`](https://github.com/boxd-sh/boxd-pi/blob/main/examples/parallel-forks.sh): set a project
   up once, fork the session twice, and let two agents try two approaches in
   parallel, each in its own copy of the machine.
 
