@@ -139,10 +139,11 @@ if (!A) {
 	process.exit(1);
 }
 
-await check("isolated is on", async () => {
+await check("isolated is on; a saved session's machine has no delete timer", async () => {
 	const m = await client.get(A.machineId);
 	assert(m.networking.isolated === true, JSON.stringify(m.networking));
-	return "networking.isolated = true";
+	assert(m.deleteAt === null, `deleteAt ${m.deleteAt}`);
+	return "networking.isolated = true, deleteAt = null";
 });
 
 await check("bash: output and exit code", async () => {
@@ -288,15 +289,20 @@ await check("/boxd status, url, push and hibernate", async () => {
 		ctxA,
 		"git init -q --bare /home/boxd/remote.git && git remote add origin /home/boxd/remote.git && git add -A && git commit -qm work",
 	);
+	// A hook the agent could have left in the repo: the push must not run it.
+	await bash(piA, ctxA, "printf '#!/bin/sh\\ntouch /home/boxd/hook-ran\\n' > .git/hooks/pre-push && chmod +x .git/hooks/pre-push");
 	await run("push pi/live");
+	assert(/^Pushed HEAD to pi\/live/.test(ctxA.notes.at(-1).message), ctxA.notes.at(-1).message);
 	const pushed = await bash(piA, ctxA, "git --git-dir=/home/boxd/remote.git log --oneline -1 pi/live");
 	assert(/work/.test(text(pushed)), text(pushed));
+	const hook = await bash(piA, ctxA, "test -e /home/boxd/hook-ran && echo hook-ran || echo hook-skipped");
+	assert(text(hook).includes("hook-skipped"), text(hook));
 	await run("hibernate");
 	const st = await settle(A.machineId, "hibernated");
 	assert(st === "hibernated", st);
 	const woke = await bash(piA, ctxA, "echo awake");
 	assert(text(woke).includes("awake"), text(woke));
-	return `pushed: ${text(pushed).trim()}; hibernated, then woke on the next call`;
+	return `pushed: ${text(pushed).trim()}; pre-push hook skipped; hibernated, then woke on the next call`;
 });
 
 let piB;
@@ -316,6 +322,7 @@ await check("fork the session: the machine is copied with files and running proc
 	assert(text(r).includes("print('boxd')") && text(r).includes("200"), text(r));
 	const fm = await client.get(B.machineId);
 	assert(fm.networking.isolated === true, "fork not isolated");
+	assert(fm.deleteAt === null, `fork deleteAt ${fm.deleteAt}`);
 	return `${B.machineName} id ${B.machineId} in ${ms} ms; file present, server answers 200 in the fork`;
 });
 
@@ -365,6 +372,9 @@ await check("in-memory session: quit deletes its machine; get(id) is not found; 
 	const C = machineOf(piC);
 	created.push(C.machineId);
 	console.log(`  created ${C.machineName} id ${C.machineId}`);
+	const hours = ((await client.get(C.machineId)).deleteAt - Date.now()) / 3_600_000;
+	assert(hours > 23.9 && hours <= 24, `delete timer in ${hours} h`);
+	console.log(`  delete timer: in ${hours.toFixed(2)} h`);
 	const machine = { client, id: C.machineId, name: C.machineName, cwd: C.cwd };
 	await piC.fire("session_shutdown", { reason: "quit" }, ctxC);
 	let gone = false;
@@ -414,6 +424,59 @@ await check("/boxd delete removes the session's machine, by id, after asking", a
 	}
 	assert(/NOT run on your computer/.test(msg), msg);
 	return ctxD.notes.at(-1).message;
+});
+
+await check("/boxd push refuses when origin is not the repo that was cloned", async () => {
+	const repo = "https://github.com/octocat/Hello-World";
+	const piE = loadPi({ "boxd-repo": repo });
+	const ctxE = fakeCtx(piE, { sessionId: `${runId}-e`, persisted: false });
+	await piE.fire("session_start", { reason: "startup" }, ctxE);
+	assert(piE.entries.length > 0, ctxE.notes.at(-1)?.message ?? "no machine");
+	const E = machineOf(piE);
+	created.push(E.machineId);
+	console.log(`  created ${E.machineName} id ${E.machineId}`);
+	assert(E.repo === repo && E.cwd === "/home/boxd/Hello-World", JSON.stringify(E));
+	const head = await bash(piE, ctxE, "git log --oneline -1 && git remote get-url origin");
+	assert(text(head).includes(repo), text(head));
+	await bash(piE, ctxE, "git remote set-url origin https://example.com/other/repo.git");
+	await piE.commands.get("boxd").handler("push pi/live", ctxE);
+	const note = ctxE.notes.at(-1);
+	assert(
+		note.type === "error" && /not https:\/\/github.com\/octocat\/Hello-World that this session cloned/.test(note.message),
+		note.message,
+	);
+	await piE.fire("session_shutdown", { reason: "quit" }, ctxE);
+	let gone = false;
+	try {
+		await client.get(E.machineId);
+	} catch (e) {
+		gone = e instanceof NotFoundError;
+	}
+	assert(gone, "machine still there");
+	console.log(`  DELETED-BY-TEST ${E.machineId}`);
+	return note.message;
+});
+
+await check("quitting while the machine is still starting leaves no machine", async () => {
+	const piF = loadPi({ "boxd-no-repo": true });
+	const ctxF = fakeCtx(piF, { sessionId: `${runId}-f`, persisted: false });
+	const start = piF.fire("session_start", { reason: "startup" }, ctxF);
+	await new Promise((r) => setTimeout(r, 50));
+	await piF.fire("session_shutdown", { reason: "quit" }, ctxF);
+	await start;
+	assert(piF.entries.length > 0, ctxF.notes.at(-1)?.message ?? "no machine");
+	const F = machineOf(piF);
+	created.push(F.machineId);
+	console.log(`  created ${F.machineName} id ${F.machineId}`);
+	let gone = false;
+	try {
+		await client.get(F.machineId);
+	} catch (e) {
+		gone = e instanceof NotFoundError;
+	}
+	assert(gone, "machine still there");
+	console.log(`  DELETED-BY-TEST ${F.machineId}`);
+	return `${F.machineName} was created and deleted again`;
 });
 
 await piA.fire("session_shutdown", { reason: "quit" }, ctxA);

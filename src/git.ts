@@ -2,11 +2,19 @@
  * Git inside the machine. The clone and push run in the machine; the host only supplies the repo URL
  * and, for github.com, a token from `gh auth token`. The token goes with that one command through git's
  * GIT_CONFIG_* variables and is not written to the machine's git config.
+ *
+ * The machine does get the token for that command: it is in the command's environment. The clone runs
+ * before the agent has touched the machine. A push runs after, in a repo the agent controls, so
+ * {@link pushBranch} skips git hooks and sends the token only when origin is still the URL that was
+ * cloned. That narrows what can read the token; it does not make the machine unable to.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type ActiveMachine, runCommand } from "./machine.ts";
-import { isGithubHttps, shellQuote } from "./util.ts";
+import { isGithubHttps, sameRepoUrl, shellQuote } from "./util.ts";
+
+/** Git with hooks off, for the commands that carry a token. */
+const GIT_NO_HOOKS = "git -c core.hooksPath=/dev/null";
 
 /** The origin URL and branch of the git checkout Pi was started in, if it is one. */
 export async function detectLocalRepo(pi: ExtensionAPI, cwd: string): Promise<{ url: string; branch?: string } | undefined> {
@@ -63,7 +71,7 @@ export async function cloneRepo(
 	token: string | undefined,
 ): Promise<void> {
 	const branchArg = branch ? `--branch ${shellQuote(branch)} ` : "";
-	const res = await runCommand(machine, `git clone ${branchArg}-- ${shellQuote(url)} ${shellQuote(dir)}`, {
+	const res = await runCommand(machine, `${GIT_NO_HOOKS} clone ${branchArg}-- ${shellQuote(url)} ${shellQuote(dir)}`, {
 		env: githubAuthEnv(url, token),
 		timeoutMs: 10 * 60_000,
 	});
@@ -80,14 +88,28 @@ export async function initWorkspace(machine: ActiveMachine, dir: string): Promis
 	if (res.exitCode !== 0) throw new Error(`could not create ${dir}: ${res.stderr.trim()}`);
 }
 
-/** Push the machine's HEAD to `branch` on origin. Returns git's output. */
+/**
+ * Push the machine's HEAD to `branch` on origin. Returns git's output.
+ *
+ * The push runs in the machine, so the machine has `token` while it runs. To keep that to the repo you
+ * started with: hooks are off, the push goes to the URL that was read (not to whatever `origin` means a
+ * moment later), and a token is sent only when origin is still `machine.repoUrl`, the URL the extension
+ * cloned. If origin was changed the push is refused; a workspace that was not cloned pushes without a token.
+ */
 export async function pushBranch(machine: ActiveMachine, branch: string, token: string | undefined): Promise<string> {
-	const origin = await runCommand(machine, "git remote get-url origin", { cwd: machine.cwd });
-	if (origin.exitCode !== 0) throw new Error("This workspace has no origin remote to push to.");
+	const origin = await runCommand(machine, "git remote get-url --push origin", { cwd: machine.cwd });
 	const url = origin.stdout.trim();
-	const res = await runCommand(machine, `git push origin ${shellQuote(`HEAD:refs/heads/${branch}`)} 2>&1`, {
+	if (origin.exitCode !== 0 || !url) throw new Error("This workspace has no origin remote to push to.");
+	if (machine.repoUrl && !sameRepoUrl(url, machine.repoUrl)) {
+		throw new Error(
+			`origin in the machine is ${url}, not ${machine.repoUrl} that this session cloned. ` +
+				"Nothing was pushed and your GitHub token was not sent.",
+		);
+	}
+	const target = machine.repoUrl ?? url;
+	const res = await runCommand(machine, `${GIT_NO_HOOKS} push -- ${shellQuote(target)} ${shellQuote(`HEAD:refs/heads/${branch}`)} 2>&1`, {
 		cwd: machine.cwd,
-		env: githubAuthEnv(url, token),
+		env: machine.repoUrl ? githubAuthEnv(machine.repoUrl, token) : {},
 		timeoutMs: 5 * 60_000,
 	});
 	if (res.exitCode !== 0) throw new Error(`git push failed: ${res.stdout.trim() || `exit ${res.exitCode}`}`);

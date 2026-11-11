@@ -8,6 +8,40 @@ or email [contact@boxd.sh](mailto:contact@boxd.sh). Include what you found, how
 to reproduce it, and the version of `@boxd-sh/pi` you use. We'll confirm we
 received it and keep you posted while we fix it.
 
+## What reaches the machine
+
+The machine runs whatever the agent runs, as a user with sudo. Treat
+everything in it as controlled by the agent.
+
+- Your boxd API key stays on your computer. Machines are created isolated:
+  no boxd credentials inside, and not on your org's private network.
+- Of your environment, only Pi's `PI_*` session variables go with a command.
+- **Your GitHub token goes to the machine twice: for the clone, and for every
+  `/boxd push`.** Git runs in the machine, so the token (from `gh auth token`
+  on your computer) is in that one command's environment. It is not written
+  to the machine's git config or disk, and it is only used when the repo is
+  on `https://github.com`.
+
+The clone runs on a new machine, before the agent has done anything in it.
+A push is different. By then the agent has worked in the machine, and a
+process there that wants your token can take it while the push runs: for
+example through a changed `git` binary or a git setting that routes the
+request elsewhere. The extension narrows this, and can't close it:
+
+- the push runs with git hooks off (`core.hooksPath=/dev/null`);
+- the token is sent only if `origin` in the machine is still the URL the
+  extension cloned, and the push goes to that URL. If `origin` was changed,
+  `/boxd push` stops and sends nothing;
+- a workspace that was not cloned (`--boxd-no-repo`) never gets the token.
+
+So `/boxd push` gives your token to the machine for the length of that
+command. If you don't trust what ran in the machine, don't use `/boxd push`.
+Fetch the work another way, or use a `gh` login with a fine-grained token that
+can only write to that one repo.
+
+Preview URLs (`preview_url`, `/boxd url`) are public to anyone who has the
+link.
+
 ## Supported versions
 
 Fixes go into the latest release.

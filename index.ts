@@ -31,9 +31,17 @@ export interface SessionEntryData {
 	cwd: string;
 	/** Region the machine lives in; reattach and fork go there whatever BOXD_REGION says now. */
 	region?: string;
+	/** The URL the extension cloned into the machine. `/boxd push` sends your token to this URL only. */
+	repo?: string;
 }
 
 const HOME = "/home/boxd";
+
+/**
+ * Safety net for a machine of an in-memory session (`--no-session`): boxd deletes it this many seconds
+ * after it was created, even if Pi was killed before it could delete the machine itself.
+ */
+export const IN_MEMORY_DELETE_AFTER = 24 * 60 * 60;
 
 /** Build the extension. Tests pass their own client factory; Pi loads the default export. */
 export function boxdExtension(makeClient: typeof createClient = createClient): (pi: ExtensionAPI) => void {
@@ -46,6 +54,8 @@ function setup(pi: ExtensionAPI, makeClient: typeof createClient): void {
 	registerFlags(pi);
 
 	let active: ActiveMachine | null = null;
+	/** The session start that is still running, so a quit in the middle of it can wait and clean up. */
+	let starting: Promise<void> | undefined;
 
 	registerTools(pi, () => active);
 
@@ -80,7 +90,7 @@ function setup(pi: ExtensionAPI, makeClient: typeof createClient): void {
 					notify(ctx, "Machine hibernated. The next tool call wakes it.", "info");
 				} else if (sub === "push") {
 					const branch = rest[0] ?? `pi/${shortId(ctx.sessionManager.getSessionId())}`;
-					const out = await pushBranch(machine, branch, await githubToken(pi));
+					const out = await pushBranch(machine, branch, machine.repoUrl ? await githubToken(pi) : undefined);
 					notify(ctx, `Pushed HEAD to ${branch}\n${out}`, "info");
 				} else if (sub === "delete") {
 					const yes = rest.includes("--yes") || rest.includes("-y");
@@ -104,8 +114,17 @@ function setup(pi: ExtensionAPI, makeClient: typeof createClient): void {
 	});
 
 	pi.on("session_start", async (event, ctx) => {
-		if (pi.getFlag("boxd") !== true || active) return;
+		if (pi.getFlag("boxd") !== true || active || starting) return;
+		starting = start(event, ctx);
+		try {
+			await starting;
+		} finally {
+			starting = undefined;
+		}
+	});
 
+	/** Find, fork or create the session's machine. Never rejects: a failure is a notice and no machine. */
+	async function start(event: { reason: string }, ctx: ExtensionContext): Promise<void> {
 		let settings: MachineSettings;
 		let creds: { apiKey?: string; token?: string } | undefined;
 		try {
@@ -127,7 +146,10 @@ function setup(pi: ExtensionAPI, makeClient: typeof createClient): void {
 		const previous = latestEntry(ctx);
 		const startedAt = Date.now();
 		const record = (m: ActiveMachine, region: string | undefined) =>
-			pi.appendEntry<SessionEntryData>(SESSION_ENTRY, { machineId: m.id, machineName: m.name, cwd: m.cwd, region });
+			pi.appendEntry<SessionEntryData>(SESSION_ENTRY, { machineId: m.id, machineName: m.name, cwd: m.cwd, region, repo: m.repoUrl });
+		// An in-memory session can't be resumed, so its machine gets a delete timer in case Pi never gets to delete it.
+		const deleteAfter = ctx.sessionManager.getSessionFile() === undefined ? IN_MEMORY_DELETE_AFTER : undefined;
+		// Set the moment boxd returns a new machine, so a start that fails after that removes it again.
 		let created: { client: MachineClient; id: string } | undefined;
 
 		try {
@@ -137,7 +159,9 @@ function setup(pi: ExtensionAPI, makeClient: typeof createClient): void {
 			const isFork = event.reason === "fork" || (found?.session !== undefined && found.session !== sessionId);
 			if (previous && found && isFork) {
 				setStatus(ctx, "☁ boxd · forking machine…");
-				const forked = await forkMachine(found.client, previous, name, labels);
+				const forked = await forkMachine(found.client, previous, name, labels, deleteAfter, (id) => {
+					created = { client: found.client, id };
+				});
 				active = forked.machine;
 				record(forked.machine, found.region);
 				// The parent session is no longer open here, so its machine can sleep.
@@ -148,7 +172,13 @@ function setup(pi: ExtensionAPI, makeClient: typeof createClient): void {
 			if (previous && found) {
 				setStatus(ctx, "☁ boxd · waking machine…");
 				await ensureRunning(found.client, previous.machineId);
-				active = { client: found.client, id: previous.machineId, name: previous.machineName, cwd: previous.cwd };
+				active = {
+					client: found.client,
+					id: previous.machineId,
+					name: previous.machineName,
+					cwd: previous.cwd,
+					repoUrl: previous.repo,
+				};
 				if (found.region !== previous.region) record(active, found.region);
 				done(ctx, active, "Reattached machine", startedAt);
 				return;
@@ -156,11 +186,15 @@ function setup(pi: ExtensionAPI, makeClient: typeof createClient): void {
 
 			setStatus(ctx, "☁ boxd · creating machine…");
 			const client = clientFor(settings.region);
-			const made = await createMachine(client, settings, name, labels, sessionId);
+			const made = await createMachine(client, settings, name, labels, sessionId, deleteAfter, (id) => {
+				created = { client, id };
+			});
 			created = { client, id: made.id };
 			const machine: ActiveMachine = { client, id: made.id, name, cwd: joinPath(HOME, "workspace") };
 			await configureIdentity(machine);
-			machine.cwd = await prepareWorkspace(pi, ctx, machine);
+			const workspace = await prepareWorkspace(pi, ctx, machine);
+			machine.cwd = workspace.cwd;
+			machine.repoUrl = workspace.repoUrl;
 			active = machine;
 			record(machine, made.region);
 			done(ctx, machine, "Machine ready", startedAt);
@@ -171,7 +205,7 @@ function setup(pi: ExtensionAPI, makeClient: typeof createClient): void {
 			setStatus(ctx, undefined);
 			notify(ctx, `boxd: could not start a machine: ${errorMessage(err)}`, "error");
 		}
-	});
+	}
 
 	// Point the model at the machine's working directory and say where its commands run.
 	pi.on("before_agent_start", (event) => {
@@ -189,6 +223,8 @@ function setup(pi: ExtensionAPI, makeClient: typeof createClient): void {
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
+		// Quitting while the machine is still starting: wait for the start, then put its machine away as usual.
+		if (starting) await starting;
 		if (!active) return;
 		const machine = active;
 		active = null;
@@ -259,11 +295,15 @@ async function forkMachine(
 	parent: SessionEntryData,
 	name: string,
 	labels: Record<string, string>,
+	deleteAfter: number | undefined,
+	onCreated: (id: string) => void,
 ): Promise<{ machine: ActiveMachine }> {
 	await ensureRunning(client, parent.machineId);
-	const fork = await client.fork(parent.machineId, { name, labels, isolated: true });
+	// A fork would inherit its parent's delete timer; 0 gives a saved session's machine none.
+	const fork = await client.fork(parent.machineId, { name, labels, isolated: true, deleteAfter: deleteAfter ?? 0 });
+	onCreated(fork.id);
 	await client.waitUntilReady(fork.id, { timeout: 120_000 });
-	return { machine: { client, id: fork.id, name: fork.name, cwd: parent.cwd } };
+	return { machine: { client, id: fork.id, name: fork.name, cwd: parent.cwd, repoUrl: parent.repo } };
 }
 
 /**
@@ -276,12 +316,14 @@ async function createMachine(
 	name: string,
 	labels: Record<string, string>,
 	sessionId: string,
+	deleteAfter: number | undefined,
+	onCreated: (id: string) => void,
 ): Promise<{ id: string; region: string | undefined }> {
 	const config = settings.size ? { vcpu: settings.size.vcpu, memory: settings.size.memory } : undefined;
+	const common = { name, org: settings.org, labels, config, isolated: true, deleteAfter };
 	try {
-		const machine = settings.snapshot
-			? await client.create({ name, org: settings.org, labels, config, fromSnapshot: settings.snapshot, isolated: true })
-			: await client.create({ name, org: settings.org, labels, config, isolated: true });
+		const machine = settings.snapshot ? await client.create({ ...common, fromSnapshot: settings.snapshot }) : await client.create(common);
+		onCreated(machine.id);
 		const ready = await client.waitUntilReady(machine.id, { timeout: 120_000 });
 		return { id: machine.id, region: ready.region ?? machine.region ?? settings.region };
 	} catch (err) {
@@ -293,8 +335,12 @@ async function createMachine(
 	}
 }
 
-/** Clone the repo (flag, or the one Pi was started in) or make an empty workspace. Returns the cwd. */
-async function prepareWorkspace(pi: ExtensionAPI, ctx: ExtensionContext, machine: ActiveMachine): Promise<string> {
+/** Clone the repo (flag, or the one Pi was started in) or make an empty workspace. Returns the cwd and the cloned URL. */
+async function prepareWorkspace(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	machine: ActiveMachine,
+): Promise<{ cwd: string; repoUrl?: string }> {
 	let repo = stringFlag(pi, "boxd-repo");
 	let branch = stringFlag(pi, "boxd-branch");
 	if (!repo && pi.getFlag("boxd-no-repo") !== true) {
@@ -307,13 +353,13 @@ async function prepareWorkspace(pi: ExtensionAPI, ctx: ExtensionContext, machine
 	if (!repo) {
 		const dir = joinPath(HOME, "workspace");
 		await initWorkspace(machine, dir);
-		return dir;
+		return { cwd: dir };
 	}
 	const url = normalizeRepoUrl(repo);
 	const dir = joinPath(HOME, repoName(url));
 	setStatus(ctx, `☁ boxd · cloning ${repoName(url)}…`);
 	await cloneRepo(machine, url, dir, branch, await githubToken(pi));
-	return dir;
+	return { cwd: dir, repoUrl: url };
 }
 
 function done(ctx: ExtensionContext, machine: ActiveMachine, what: string, startedAt: number): void {

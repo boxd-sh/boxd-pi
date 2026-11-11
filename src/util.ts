@@ -51,6 +51,16 @@ export function isGithubHttps(url: string): boolean {
 	}
 }
 
+/** True when two repo URLs name the same repo: equal apart from a trailing slash or `.git`. */
+export function sameRepoUrl(a: string, b: string): boolean {
+	const bare = (url: string) =>
+		url
+			.trim()
+			.replace(/\/+$/, "")
+			.replace(/\.git$/, "");
+	return bare(a) === bare(b);
+}
+
 /** Keep only Pi's session variables (PI_*) from the host environment; nothing else leaves the host. */
 export function piSessionEnv(env: NodeJS.ProcessEnv | undefined): Record<string, string> {
 	const out: Record<string, string> = {};

@@ -57,8 +57,11 @@ pi --boxd --boxd-snapshot my-toolchain                        # start from a box
 ```
 
 For a private GitHub repo the extension uses the token from your `gh` login for
-the clone. The token goes with that one command and is not stored in the
-machine.
+the clone. The clone runs in the machine, so the machine gets the token for
+that one command. It is not written to the machine's git config or disk.
+`/boxd push` gives the machine your token in the same way, after the agent has
+worked in it: read [SECURITY.md](SECURITY.md) before you push from a machine
+whose agent you don't trust.
 
 ## Flags
 
@@ -91,7 +94,7 @@ Without `--boxd` the extension does nothing and Pi's own tools run as usual.
 | `/boxd` or `/boxd status` | Show the machine, its state and its URL |
 | `/boxd url <port>` | Public HTTPS URL for a port in the machine |
 | `/boxd hibernate` | Hibernate now; the next tool call wakes it |
-| `/boxd push [branch]` | Push the machine's `HEAD` to a branch on `origin` (default `pi/<session>`), with your `gh` token for GitHub |
+| `/boxd push [branch]` | Push the machine's `HEAD` to a branch (default `pi/<session>`) of the repo the session cloned. For GitHub this gives the machine your `gh` token for that command. Git hooks don't run, and the push is refused if `origin` was changed |
 | `/boxd delete [--yes]` | Delete the machine. Asks first; `--yes` skips the question, and is required in `pi -p` |
 
 The agent also gets a `preview_url` tool. After it starts a server it can hand
@@ -107,6 +110,8 @@ call fails and says so.
 | --- | --- |
 | No API key | a notice `boxd: no API key. Set BOXD_API_KEY...`, and every tool call fails with `...the tool was NOT run on your computer` |
 | boxd refused the key, or the machine could not be created or set up | a notice `boxd: could not start a machine: <reason>`; a machine that start created is deleted again, and tool calls fail as above |
+| A new machine or a fork is not ready within 120 seconds | the same notice; the new machine or fork is deleted. The machine a fork was copied from is kept |
+| You quit while the machine is still starting | Pi waits for the start to finish, then hibernates the machine, or deletes it for an in-memory session |
 | `--boxd-size` is not a boxd size | a notice `Unknown machine size "<value>". Use one of 1x4, 2x8, 4x16, 8x32.`; nothing is created |
 | The clone failed (wrong URL, no access) | `could not start a machine: git clone failed: <git's message>`; the machine is deleted |
 | The machine was stopped or is hibernated | the extension starts or wakes it (trying again for up to 120 seconds if it isn't ready yet) and runs the call once more |
@@ -116,6 +121,8 @@ call fails and says so.
 | A command runs past the `timeout` the agent gave it, or you press Ctrl-C | the call ends and so does the command's process in the machine |
 | A file is missing, or is a directory | Pi's usual `read`/`edit` error, from the machine's filesystem |
 | `/boxd push` fails | `boxd: git push failed: <git's message>` |
+| `/boxd push` after `origin` in the machine was changed | `boxd: origin in the machine is <url>, not <url> that this session cloned. Nothing was pushed and your GitHub token was not sent.` |
+| `/boxd push` in a workspace that was not cloned (`--boxd-no-repo`) | the push goes to the `origin` you or the agent added, without your token |
 
 In `pi -p` and JSON mode these notices go to stderr, prefixed `[boxd-pi]`.
 
@@ -124,6 +131,7 @@ In `pi -p` and JSON mode these notices go to stderr, prefixed `[boxd-pi]`.
 | | Limit |
 | --- | --- |
 | Machines | one per Pi session; a forked session gets its own copy |
+| In-memory sessions | the machine is deleted when Pi exits, and by boxd 24 hours after it was created at the latest, also while Pi is still running |
 | Machine size | `1x4`, `2x8`, `4x16` or `8x32`, up to your org's quota |
 | Machine ready | create, fork and wake wait up to 120 seconds; a new machine is usually ready in about a second |
 | Clone | 10 minutes; `/boxd push` 5 minutes |
@@ -147,7 +155,9 @@ The extension overrides Pi's built-in tools with versions that call the
 | `preview_url` | a boxd named proxy, `p<port>`, on the machine |
 
 Your boxd API key never enters the machine, and nothing from your shell
-environment goes with a command except Pi's `PI_*` variables.
+environment goes with a command except Pi's `PI_*` variables. The one secret
+that does reach the machine is your GitHub token, for the clone and for
+`/boxd push`: see [SECURITY.md](SECURITY.md).
 
 | Pi does | The extension does |
 | --- | --- |
@@ -155,7 +165,7 @@ environment goes with a command except Pi's `PI_*` variables.
 | resumes a session (`pi -c`, `/resume`, `--session`) | wakes the recorded machine; creates a new one only if it was deleted |
 | forks a session (`/fork`, `pi --fork`) | forks the parent's machine (disk, memory and running processes), then hibernates the parent's |
 | quits | hibernates the machine, memory and running processes included. The next tool call wakes it |
-| quits an in-memory session (`--no-session`) | deletes the machine, since the session can't be resumed |
+| quits an in-memory session (`--no-session`) | deletes the machine, since the session can't be resumed. The machine also carries a 24 hour delete timer from the start, in case Pi is killed before it can delete it |
 
 Machines are isolated: they are not on your org's private network and have no
 boxd credentials inside. A machine whose session you delete stays hibernated
@@ -207,7 +217,7 @@ pi -e ./index.ts --boxd
 
 The unit tests run the extension against a fake boxd client and a fake Pi.
 `npm run test:live` drives the extension with Pi's real tool definitions
-against real machines, named `pi-live-<run>-<a|b|c|d>`
+against real machines, named `pi-live-<run>-<a to f>`
 (`BOXD_PI_NAME_PREFIX` changes the prefix). It deletes every machine it
 creates.
 

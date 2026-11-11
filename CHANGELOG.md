@@ -13,11 +13,16 @@ Initial release.
 - Clones the checkout's `origin` at your branch, another repo
   (`--boxd-repo`, `--boxd-branch`) or starts an empty workspace
   (`--boxd-no-repo`). Uses your `gh` token for GitHub, for that one command.
+- A machine or fork that does not become ready is deleted again, and quitting
+  while a machine is still starting puts it away like any other quit. The
+  machine of an in-memory session also has a 24 hour delete timer.
 - `--boxd-size`, `--boxd-region`, `--boxd-org` and `--boxd-snapshot` for new
   machines.
 - `preview_url` tool and `/boxd url <port>` for public HTTPS links to servers
   in the machine.
 - `/boxd status`, `/boxd hibernate`, `/boxd push [branch]` and
-  `/boxd delete [--yes]`.
+  `/boxd delete [--yes]`. `/boxd push` runs with git hooks off and only pushes
+  to the repo the session cloned. It gives the machine your GitHub token for
+  that command: see SECURITY.md.
 - Three examples (`examples/`): a quick start, a persistent session that
   hibernates between runs, and two agents working on two forks in parallel.

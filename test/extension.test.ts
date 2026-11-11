@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { boxdExtension, SESSION_ENTRY, type SessionEntryData } from "../index.ts";
+import { boxdExtension, IN_MEMORY_DELETE_AFTER, SESSION_ENTRY, type SessionEntryData } from "../index.ts";
 import { FakeBoxd, FakePi, fakeCtx } from "./fake.ts";
 
 function load(boxd: FakeBoxd, flags: Record<string, boolean | string> = { boxd: true }) {
@@ -145,10 +145,100 @@ describe("session lifecycle", () => {
 			const clone = boxd
 				.called("exec")
 				.map((c) => c.args[1] as { command: string[]; env?: Record<string, string> })
-				.find((p) => p.command[2].startsWith("git clone"))!;
-			assert.equal(clone.command[2], "git clone --branch 'dev' -- 'https://github.com/acme/api.git' '/home/boxd/api'");
+				.find((p) => p.command[2].includes(" clone "))!;
+			assert.equal(
+				clone.command[2],
+				"git -c core.hooksPath=/dev/null clone --branch 'dev' -- 'https://github.com/acme/api.git' '/home/boxd/api'",
+			);
 			assert.ok(clone.env?.GIT_CONFIG_VALUE_0?.startsWith("AUTHORIZATION: basic "));
 			assert.equal((pi.entries.at(-1)!.data as SessionEntryData).cwd, "/home/boxd/api");
+			assert.equal((pi.entries.at(-1)!.data as SessionEntryData).repo, "https://github.com/acme/api.git");
+		}));
+
+	it("deletes a new machine that never becomes ready", () =>
+		withKey(async () => {
+			const boxd = new FakeBoxd();
+			boxd.readyError = new Error("timed out waiting for the machine");
+			const pi = load(boxd, { boxd: true, "boxd-no-repo": true });
+			const ctx = fakeCtx(pi);
+			await pi.fire("session_start", { reason: "startup" }, ctx);
+			assert.equal(boxd.called("create").length, 1);
+			assert.deepEqual(
+				boxd.called("delete").map((c) => c.args[0]),
+				["nyc-1"],
+			);
+			assert.equal(boxd.machines.size, 0);
+			assert.equal(pi.entries.length, 0);
+			assert.match(ctx.notes.at(-1)!.message, /could not start a machine: timed out/);
+		}));
+
+	it("deletes a fork that never becomes ready, and leaves the parent's machine alone", () =>
+		withKey(async () => {
+			const boxd = new FakeBoxd();
+			boxd.add({ id: "m-parent", name: "pi-parent" });
+			boxd.readyError = new Error("timed out waiting for the machine");
+			const pi = load(boxd);
+			pi.appendEntry(SESSION_ENTRY, { machineId: "m-parent", machineName: "pi-parent", cwd: "/home/boxd/api" });
+			const ctx = fakeCtx(pi, { sessionId: "child-session" });
+			await pi.fire("session_start", { reason: "fork" }, ctx);
+			assert.equal(boxd.called("fork").length, 1);
+			assert.deepEqual(
+				boxd.called("delete").map((c) => c.args[0]),
+				["nyc-1"],
+			);
+			assert.deepEqual([...boxd.machines.keys()], ["m-parent"]);
+			assert.equal(pi.entries.length, 1);
+			assert.match(ctx.notes.at(-1)!.message, /could not start a machine: timed out/);
+		}));
+
+	it("a quit while the machine is still starting waits for it, then deletes or hibernates it", () =>
+		withKey(async () => {
+			for (const [persisted, expect] of [
+				[false, "delete"],
+				[true, "hibernate"],
+			] as const) {
+				const boxd = new FakeBoxd();
+				let release = () => {};
+				boxd.createGate = new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				const pi = load(boxd, { boxd: true, "boxd-no-repo": true });
+				const ctx = fakeCtx(pi, { persisted });
+				const start = pi.fire("session_start", { reason: "startup" }, ctx);
+				await new Promise((r) => setImmediate(r));
+				const quit = pi.fire("session_shutdown", { reason: "quit" }, ctx);
+				await new Promise((r) => setImmediate(r));
+				assert.equal(boxd.called("delete").length + boxd.called("hibernate").length, 0, "nothing to put away yet");
+				release();
+				await Promise.all([start, quit]);
+				assert.deepEqual(
+					boxd.called(expect).map((c) => c.args[0]),
+					["nyc-1"],
+					`persisted=${persisted}`,
+				);
+				assert.equal(boxd.machines.get("nyc-1")?.status, persisted ? "hibernated" : undefined);
+			}
+		}));
+
+	it("gives an in-memory session's machine a delete timer, and a saved session's machine none", () =>
+		withKey(async () => {
+			const timer = async (persisted: boolean, parent: boolean) => {
+				const boxd = new FakeBoxd();
+				const pi = load(boxd, { boxd: true, "boxd-no-repo": true });
+				if (parent) {
+					boxd.add({ id: "m-parent", name: "pi-parent" });
+					pi.appendEntry(SESSION_ENTRY, { machineId: "m-parent", machineName: "pi-parent", cwd: "/home/boxd/api" });
+				}
+				await pi.fire("session_start", { reason: parent ? "fork" : "startup" }, fakeCtx(pi, { persisted, sessionId: "s-1" }));
+				const call = parent ? boxd.called("fork")[0].args[1] : boxd.called("create")[0].args[0];
+				return (call as { deleteAfter?: number }).deleteAfter;
+			};
+			assert.equal(await timer(false, false), IN_MEMORY_DELETE_AFTER);
+			assert.equal(await timer(true, false), undefined);
+			assert.equal(await timer(false, true), IN_MEMORY_DELETE_AFTER);
+			// A fork would inherit its parent's timer: 0 clears it for a session that is kept.
+			assert.equal(await timer(true, true), 0);
+			assert.equal(IN_MEMORY_DELETE_AFTER, 86_400);
 		}));
 
 	it("deletes a machine it created when setup fails, and stays off", () =>
@@ -258,5 +348,82 @@ describe("/boxd delete", () => {
 				pi.tools.get("bash")!.execute("id", { command: "echo hi" }, undefined, undefined, ctx as never),
 				/NOT run on your computer/,
 			);
+		}));
+});
+
+describe("/boxd push", () => {
+	type Exec = { command: string[]; env?: Record<string, string>; cwd?: string };
+	const CLONED = "https://github.com/acme/api.git";
+
+	/** A session whose machine was cloned from CLONED (or has an empty workspace), with a gh login on the host. */
+	async function started(repo = true) {
+		const boxd = new FakeBoxd();
+		const pi = load(boxd, repo ? { boxd: true, "boxd-repo": CLONED } : { boxd: true, "boxd-no-repo": true });
+		pi.execResults.set("gh auth token", { code: 0, stdout: "gho_test\n", stderr: "" });
+		const ctx = fakeCtx(pi);
+		await pi.fire("session_start", { reason: "startup" }, ctx);
+		const before = boxd.called("exec").length;
+		const push = async (origin: string) => {
+			boxd.execResults.push({ stdout: `${origin}\n`, stderr: "", exitCode: 0 });
+			await pi.commands.get("boxd")!.handler("push work", ctx as never);
+			return boxd
+				.called("exec")
+				.slice(before)
+				.map((c) => c.args[1] as Exec);
+		};
+		return { boxd, pi, ctx, push };
+	}
+
+	it("pushes to the URL that was cloned, with git hooks off and the token only in that command's env", () =>
+		withKey(async () => {
+			const { ctx, push } = await started();
+			const [readOrigin, pushed, ...rest] = await push("https://github.com/acme/api");
+			assert.equal(readOrigin.command[2], "git remote get-url --push origin");
+			assert.equal(readOrigin.env, undefined);
+			assert.equal(pushed.command[2], `git -c core.hooksPath=/dev/null push -- '${CLONED}' 'HEAD:refs/heads/work' 2>&1`);
+			assert.ok(pushed.env?.GIT_CONFIG_VALUE_0?.startsWith("AUTHORIZATION: basic "));
+			assert.equal(pushed.cwd, "/home/boxd/api");
+			assert.equal(rest.length, 0);
+			assert.match(ctx.notes.at(-1)!.message, /^Pushed HEAD to work/);
+		}));
+
+	it("refuses when origin is no longer the URL that was cloned, and sends no token", () =>
+		withKey(async () => {
+			for (const origin of ["https://github.com/someone-else/api.git", "https://example.com/acme/api.git", "/home/boxd/elsewhere.git"]) {
+				const { ctx, push } = await started();
+				const calls = await push(origin);
+				assert.equal(calls.length, 1, "only the origin lookup ran");
+				assert.equal(calls[0].env, undefined);
+				const note = ctx.notes.at(-1)!;
+				assert.equal(note.type, "error");
+				assert.ok(note.message.includes(`origin in the machine is ${origin}, not ${CLONED}`), note.message);
+				assert.match(note.message, /token was not sent/);
+			}
+		}));
+
+	it("sends no token from a workspace the extension did not clone", () =>
+		withKey(async () => {
+			const { push } = await started(false);
+			const calls = await push("https://github.com/acme/api.git");
+			assert.equal(calls.length, 2);
+			assert.match(calls[1].command[2], /^git -c core\.hooksPath=\/dev\/null push -- 'https:\/\/github\.com\/acme\/api\.git' /);
+			for (const c of calls) assert.deepEqual(c.env ?? {}, {});
+		}));
+
+	it("a resumed session and a forked one keep the cloned URL", () =>
+		withKey(async () => {
+			for (const reason of ["resume", "fork"] as const) {
+				const boxd = new FakeBoxd();
+				boxd.add({ id: "m-old", name: "pi-old" });
+				const pi = load(boxd);
+				pi.execResults.set("gh auth token", { code: 0, stdout: "gho_test\n", stderr: "" });
+				pi.appendEntry(SESSION_ENTRY, { machineId: "m-old", machineName: "pi-old", cwd: "/home/boxd/api", repo: CLONED });
+				const ctx = fakeCtx(pi, { sessionId: reason === "fork" ? "child-session" : undefined });
+				await pi.fire("session_start", { reason }, ctx);
+				if (reason === "fork") assert.equal((pi.entries.at(-1)!.data as SessionEntryData).repo, CLONED);
+				boxd.execResults.push({ stdout: "https://github.com/someone-else/api.git\n", stderr: "", exitCode: 0 });
+				await pi.commands.get("boxd")!.handler("push work", ctx as never);
+				assert.match(ctx.notes.at(-1)!.message, /token was not sent/, reason);
+			}
 		}));
 });

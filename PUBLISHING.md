@@ -32,8 +32,8 @@ Nothing here is published yet.
    npm pack
    ```
 
-   It holds `index.ts`, `src/`, `README.md`, `CHANGELOG.md`, `LICENSE` and
-   `package.json`, and nothing else.
+   It holds `index.ts`, `src/`, `README.md`, `CHANGELOG.md`, `SECURITY.md`,
+   `LICENSE` and `package.json`, and nothing else.
 
 4. Install the tarball the way users do and run the README quick start from
    it, so you test what users get:

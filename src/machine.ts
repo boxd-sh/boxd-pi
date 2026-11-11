@@ -19,6 +19,8 @@ export interface ActiveMachine {
 	name: string;
 	/** Working directory inside the machine (the cloned repo, or ~/workspace). */
 	cwd: string;
+	/** The URL the extension cloned into `cwd`, if it cloned one. The only place `/boxd push` sends a token. */
+	repoUrl?: string;
 }
 
 /** Thrown when the session's machine no longer exists. Tool calls fail; nothing runs on the host. */

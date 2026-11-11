@@ -33,6 +33,10 @@ export class FakeBoxd {
 	closed = 0;
 	/** How many wake() calls fail before one succeeds. */
 	wakeFailures = 0;
+	/** When set, waitUntilReady() throws it: a machine that never becomes ready. */
+	readyError: Error | undefined;
+	/** When set, create() waits for it before returning: a start that is still running. */
+	createGate: Promise<void> | undefined;
 	private seq = 0;
 	/** Region this fake serves; `elsewhere` is what a not-found reports about other regions. */
 	region: string;
@@ -96,6 +100,7 @@ export class FakeBoxd {
 			async create(params: { name: string; labels: Record<string, string>; isolated?: boolean }) {
 				self.log("create", params);
 				if ([...self.machines.values()].some((m) => m.name === params.name)) throw new ConflictError("name taken");
+				if (self.createGate) await self.createGate;
 				const m = self.add({
 					id: `${self.region}-${++self.seq}`,
 					name: params.name,
@@ -141,6 +146,7 @@ export class FakeBoxd {
 			},
 			async waitUntilReady(id: string) {
 				self.log("waitUntilReady", id);
+				if (self.readyError) throw self.readyError;
 				const m = self.find(id);
 				if (m.status === "pending") m.status = "running";
 				return view(m);
