@@ -1,4 +1,4 @@
-![boxd: a cloud machine for every Pi session](assets/banner.png)
+![boxd: a cloud machine for every Pi session](https://raw.githubusercontent.com/boxd-sh/boxd-pi/main/assets/banner.png)
 
 # boxd-pi
 
